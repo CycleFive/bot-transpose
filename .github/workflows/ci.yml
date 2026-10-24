@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: core and web depend on no chat platform
+        run: |
+          for p in transpose-core transpose-web; do
+            if cargo tree -p "$p" --prefix none | grep -E '^(serenity|poise|songbird|ruma|matrix-sdk|rive|teloxide)' ; then
+              echo "$p depends on a platform crate" >&2; exit 1
+            fi
+          done

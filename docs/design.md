@@ -16,6 +16,16 @@ the real platform crates (serenity 0.12.5, ruma 0.17.2, rive-models 1.2.1) and
 runs the same bot logic through all three. Its code is illustration; the
 structure is the point.
 
+## Decisions so far (the owner, 2026-10-24)
+
+| Question | Decision | Where it shows |
+|---|---|---|
+| How ids are represented | **Text**, everywhere | `RawId(Arc<str>)` in §4.1 |
+| How they are stored | **A `(platform, raw)` column pair**, so the platform is a typed column that can be extended or deprecated | §4.9, `docs/schema.sql`, `Lifecycle` |
+| Does the dashboard use the neutral types? | **Yes.** crack-web should speak refs too | §4.10, `crates/web` |
+| Which platform comes second | **Stoat first, then Matrix** | the Stoat adapter is the most complete (§5) |
+| What cracktunes does next | **Steps 1–3 of §6**, worth doing even on Discord alone | §6 |
+
 ## 1. Why now
 
 The topology map of cracktunes (ct#632) measured what "Discord-specific" means in
@@ -107,10 +117,15 @@ pub type MessageRef = Ref<Message>; pub type RoleRef = Ref<Role>;
   `Clone`, not `Copy`. A clone is a reference-count bump, and core mostly passes
   `&UserRef`. cracktunes code that passes `GuildId` by value today will need a
   `.clone()` or a borrow.
-- **One storage key: `<platform>:<raw>`.** For example `discord:80351110224678912`,
-  `matrix:@alice:example.org`, `stoat:01HV3W4QY7M0S0C5ZRJ4XK2B7D`. Serde uses it,
-  so settings JSON and database columns hold one string. The kind comes from the
-  column, not the key.
+- **Stored as a column pair, `(platform, raw)`.** The platform is a typed column (a
+  Postgres enum; §4.9) and the raw id is text. JSON mirrors the pair as
+  `{"platform": "stoat", "id": "01HV…"}`, so the dashboard receives the typed
+  platform too. A one-line key, `<platform>:<raw>`, exists for logs, config files
+  and map keys. The kind is never stored: it comes from the column the pair is in.
+- **A platform has a lifecycle.** `Active` platforms mint refs. `Modelled`
+  (Telegram: capability tables only, no adapter) and `Deprecated` (had an adapter
+  once) refuse `Ref::new`. `Ref::from_stored` still loads them, so old rows stay
+  readable after a platform is retired.
 - **The only exit is checked.** `Ref::raw_for(platform)` refuses a ref from
   another platform, so a Matrix room can never reach a Discord API call.
 - **Adapters convert with extension traits, not `From`.** The orphan rule forbids
@@ -211,6 +226,16 @@ button press, and an ordinary reply elsewhere. A setting such as
   happened:** a Discord button, a Telegram button, a Matrix reaction or a Stoat
   reaction. In the PoC, a reaction press and a typed `!skip` both reach
   `bot::skip` and are decided the same way (stoat adapter test).
+- **Reaction platforms need a memory; button platforms don't.** A Discord button
+  carries its action id as `custom_id`. A Stoat or Matrix reaction says only "user
+  U reacted ⏭ on message M". `render::Pressables` remembers which emoji meant which
+  action on each message the bot sent. It ignores the bot's own seed reactions,
+  stray emoji and forgotten messages.
+
+| Inbound, per adapter | Discord | Matrix | Stoat |
+|---|---|---|---|
+| command | an application-command interaction | `m.text` body through `parse_text` (`m.notice` is ignored: that's bot output) | message `content` through `parse_text` |
+| press | `press(custom_id, …)`, no lookup | `m.reaction` annotation through `Pressables` | `MessageReact` event through `Pressables` |
 
 ### 4.6 Voice (`voice.rs`)
 
@@ -224,8 +249,8 @@ pub struct LiveKitGrant  { pub url: String, pub token: String, pub media_e2ee: b
 | | signalling | media | notes |
 |---|---|---|---|
 | Discord | gateway voice-state update, then voice-server update | songbird: UDP, Opus, DAVE (MLS) | DAVE has been mandatory since 2026-03-01; cracktunes' songbird already copes in production |
-| Matrix | MatrixRTC member state event, an OpenID token, exchanged at the LiveKit JWT service | LiveKit room (`livekit` crate) | call media can be E2EE with keys sent over Matrix; the bot must take part in that key exchange |
-| Stoat | `POST /channels/{id}/join_call` | LiveKit room | rive-models 1.2.1 predates this; check against stoat.js |
+| Matrix | MatrixRTC member state event, an OpenID token, exchanged at the LiveKit JWT service (`SfuResponse { url, jwt }` → `grant`) | LiveKit room (`livekit` crate) | call media can be E2EE with keys sent over Matrix, so the grant says `media_e2ee: true` and the bot must take part in that key exchange |
+| Stoat | `POST /channels/{id}/join_call` (`join_call_path`, then `JoinCallResponse { url, token }` → `grant`) | LiveKit room | rive-models 1.2.1 predates this, so the response shape is ours; check it against stoat.js |
 | Telegram | — | — | `VoiceSupport::Unsupported` with a bot token |
 
 The queue is core's, and a transport only plays what it is handed, then reports
@@ -257,20 +282,76 @@ error types. That is 15 cuts, according to the map. Split it:
 A missing Discord permission becomes `Forbidden`, which core can phrase the same
 way everywhere.
 
+### 4.9 Storage (`storage.rs`, `docs/schema.sql`)
+
+Core holds no database crate. `storage.rs` has the plain row shapes a repository
+layer binds:
+- `RefColumns { platform, raw }` for any ref;
+- `ScopeColumns { kind, at }` for a settings scope, stored as
+  `(scope_kind, scope_platform, scope_raw)`.
+
+Loading goes through `Ref::from_stored`, so an empty raw id is an error and a
+deprecated platform still loads.
+
+`docs/schema.sql` shows the Postgres side:
+- a `platform` enum type;
+- a `platform_lifecycle` table that mirrors `Platform::lifecycle()`, with a
+  trigger that refuses new rows for inactive platforms;
+- `settings` keyed by the scope triple;
+- child tables for what `GuildSettings` keeps as bare `u64` today
+  (authorized users, ignored rooms), each with a check that the ref's platform
+  matches the scope's.
+
+**Extending** is a new `Platform` variant plus `ALTER TYPE platform ADD VALUE`
+and a lifecycle row. **Deprecating** is `Lifecycle::Deprecated` plus an update to
+that row. Enum values are never dropped while rows mention them. With sqlx,
+`Platform` would derive `sqlx::Type` against the enum.
+
+### 4.10 The dashboard (`crates/web`)
+
+`transpose-web` is what crack-web would become, and it depends on core only. It
+shows the dashboard needs no platform crate either.
+- **`Directory`** is a trait adapters implement from their caches to turn refs into
+  display names. Lookups are optional, and a missing name falls back to the ref's
+  key with `known: false`, so a user who left still shows up.
+- **`SettingsView`** carries the scope (with its label), the settings, and the
+  platform's `PlatformCaps` with the `gate_options` it allows. The page can then
+  offer a role picker on Discord and Stoat, a power-level field on Matrix, and
+  neither where no such gate exists.
+- **`SettingsPatch`** is what the page sends back. It denies unknown fields (an old
+  page posting `guild_id` fails loudly), and `apply` validates the whole result
+  with `Settings::check`. A role gate on Matrix, or a Discord user in a Stoat
+  server's list, is refused with a typed error before anything is stored.
+- **`QueueView`** labels requesters through the same `Directory`.
+
+The Stoat adapter's `StoatDirectory` feeds it from rive-models' `User`, `Server`
+and `Channel`, which covers the path from adapter cache to dashboard JSON.
+
 ## 5. What the proof of concept shows
 
-- **Platform isolation:** `cargo tree -p transpose-core` contains no chat crate.
-- **25 tests, clippy clean.** Each adapter test runs the same `bot::now_playing` and
-  `bot::skip` against its platform's real types:
-  - Discord: a DJ role gate through serenity `Permissions` and `RoleId`.
+- **Platform isolation:** `cargo tree -p transpose-core` and
+  `cargo tree -p transpose-web` contain no chat crate.
+- **43 tests, clippy and rustfmt clean, CI on every push.** Each adapter runs the
+  same `bot::now_playing` and `bot::skip` against its platform's real types:
+  - Discord: a DJ role gate through serenity `Permissions` and `RoleId`; a button
+    press carries its id.
   - Matrix: a power-level gate through ruma's `RoomPowerLevels`, including a v12
-    creator.
-  - Stoat: a reaction press decided by rive-models' `Permission` bits.
+    creator; `m.text` commands and seeded `m.reaction`s become events; signalling
+    ends in an encrypted LiveKit grant.
+  - Stoat (the next platform, so the most complete):
+    - a reaction press, decided by rive-models' `Permission` bits;
+    - prefixed commands from `Message`;
+    - pinned reactions resolved through `Pressables`;
+    - a private reply sent as an ordinary reply in `SendMessageData`;
+    - `join_call` signalling into a LiveKit grant;
+    - a `StoatDirectory` feeding the dashboard view.
 - **Rendering:** the same card renders three ways, asserted on the platform types'
   own serialised JSON: serenity's embed builder, ruma's `RoomMessageEventContent`,
   and rive-models' `SendableEmbed` and `Interactions`.
+- **Storage:** refs and scopes round-trip through the column-pair row shapes; the
+  JSON form is the same pair.
 
-What it does not show: any I/O, real voice, the database, or a running bot.
+What it does not show: any I/O, real voice, a live database, or a running bot.
 
 ## 6. What this means for cracktunes
 
@@ -283,9 +364,10 @@ after, then `diff`.
    (553 + 349 + 182 + 160, counting a unit once per type), gradually.
 2. **`Settings { scope }`.** Replace `guild_id` with `scope`, and the bare-`u64`
    maps with `BTreeSet<UserRef>`, `BTreeSet<RoleRef>` and `BTreeSet<RoomRef>`.
-   This needs a DB migration from bigint ids to key strings (or a `(platform, raw)`
-   pair). It removes `GuildSettings` from the carrier list (sole carrier for 42
-   units).
+   This needs a DB migration from bigint ids to the `(platform, raw)` column pair
+   (§4.9). It removes `GuildSettings` from the carrier list (sole carrier for 42
+   units). crack-web's settings page moves to `SettingsView` and `SettingsPatch` in
+   the same step (§4.10), since it reads and writes the same rows.
 3. **`Card` in place of `Rendered`.** The Discord adapter's renderer becomes the
    only place `CreateEmbed` and `CreateComponent` appear. `Rendered` carries taint
    into 89 units.
@@ -297,22 +379,18 @@ after, then `diff`.
 6. **Error split** (4.8).
 
 Steps 1–3 are worth doing even if CrackTunes never leaves Discord. They are the
-"business logic detangled from discord specific" the owner asked for. Steps 4–6
-pay off only with a second platform.
+"business logic detangled from discord specific" the owner asked for, and they
+are next. Steps 4–6 pay off only with a second platform. Stoat comes first: it is
+closest to Discord, and its voice needs only LiveKit signalling, with no media
+encryption to join. Matrix follows.
 
-## 7. Open questions for the owner
+## 7. Still open
 
-- **Ids.** Opaque text refs everywhere, or keep `u64` snowflakes on the Discord
-  fast path? This design chose text, and pays a `.clone()` where cracktunes passes
-  ids by value today.
-- **Database.** Key strings (`discord:123`) or a `(platform, raw)` column pair?
-  Either way, the bigint id columns need a migration.
-- **Does the dashboard (crack-web) speak refs too?** Its pages are among the top
-  seams (`settings_page`, `queue_page`).
 - **Matrix scope.** When a room is in a space, do settings follow the space or the
   room? This design follows the space only when it is configured explicitly.
-- **Which second platform comes first, if any:** Matrix (users waiting, harder
-  voice) or Stoat (closest to Discord, simpler voice)?
+  Nothing is needed until Matrix is next.
+- **The id migration's order.** Is it one migration that rewrites every bigint id
+  column, or one per table as each step lands? Step 2 decides it for settings.
 
 ## 8. Non-goals
 

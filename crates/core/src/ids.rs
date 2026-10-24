@@ -6,10 +6,14 @@
 //! - **Opaque**: core code compares, hashes, stores and prints refs, and never parses
 //!   or does arithmetic on them. Only an adapter knows what the raw text means.
 //!
-//! Refs serialise as one stable string, `<platform>:<raw>`, for example
-//! `discord:80351110224678912`, `matrix:@alice:example.org`, or
-//! `stoat:01HV3W4QY7M0S0C5ZRJ4XK2B7D`. The kind is not in the key: it comes from
-//! the column or field the key is stored in.
+//! Storage is a column pair, `(platform, raw)`: the platform is a typed column
+//! (a Postgres enum in `docs/schema.sql`) that can be extended or deprecated,
+//! and the raw id is text. JSON mirrors it as `{"platform": "...", "id": "..."}`,
+//! so the dashboard receives the same typed platform. A one-line key,
+//! `<platform>:<raw>`, exists for logs, config files and map keys
+//! (`discord:80351110224678912`, `matrix:@alice:example.org`).
+//!
+//! The kind is never stored: it comes from the column or field the pair is in.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -30,8 +34,35 @@ pub enum Platform {
     Telegram,
 }
 
+/// Where a platform is in its life. Extending the model is a new `Platform`
+/// variant plus `ALTER TYPE platform ADD VALUE`. Deprecating one sets it to
+/// `Deprecated`: rows that mention it stay readable, but no new ref can be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// Has an adapter; new refs welcome.
+    Active,
+    /// In the capability tables only, with no adapter. Telegram is here.
+    Modelled,
+    /// Had an adapter once; stored refs load, new ones are refused.
+    Deprecated,
+}
+
+impl Lifecycle {
+    pub const fn mints_refs(self) -> bool {
+        matches!(self, Lifecycle::Active)
+    }
+}
+
 impl Platform {
-    pub const fn key(self) -> &'static str {
+    pub const ALL: [Platform; 4] = [
+        Platform::Discord,
+        Platform::Matrix,
+        Platform::Stoat,
+        Platform::Telegram,
+    ];
+
+    /// The value in the `platform` column, and the prefix of a key.
+    pub const fn as_str(self) -> &'static str {
         match self {
             Platform::Discord => "discord",
             Platform::Matrix => "matrix",
@@ -40,14 +71,22 @@ impl Platform {
         }
     }
 
-    fn from_key(s: &str) -> Option<Self> {
-        Some(match s {
-            "discord" => Platform::Discord,
-            "matrix" => Platform::Matrix,
-            "stoat" => Platform::Stoat,
-            "telegram" => Platform::Telegram,
-            _ => return None,
-        })
+    pub const fn lifecycle(self) -> Lifecycle {
+        match self {
+            Platform::Discord | Platform::Matrix | Platform::Stoat => Lifecycle::Active,
+            Platform::Telegram => Lifecycle::Modelled,
+        }
+    }
+}
+
+impl FromStr for Platform {
+    type Err = RefError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Platform::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s)
+            .ok_or_else(|| RefError::UnknownPlatform(s.to_string()))
     }
 }
 
@@ -110,9 +149,22 @@ pub struct Ref<K: Kind> {
 }
 
 impl<K: Kind> Ref<K> {
-    /// Adapters build refs; core code only receives them. Empty raw ids are refused,
-    /// as is anything with control characters, so a key always round-trips.
+    /// A fresh ref, made by an adapter from a platform id. Refused for platforms
+    /// that are not `Active`, so a deprecated platform gains no new rows.
     pub fn new(platform: Platform, raw: impl AsRef<str>) -> Result<Self, RefError> {
+        if !platform.lifecycle().mints_refs() {
+            return Err(RefError::NotMinting {
+                platform,
+                lifecycle: platform.lifecycle(),
+            });
+        }
+        Self::from_stored(platform, raw)
+    }
+
+    /// A ref read back from storage or JSON. Any known platform loads, including
+    /// a deprecated one. Empty raw ids and control characters are refused, so the
+    /// pair and the key always round-trip.
+    pub fn from_stored(platform: Platform, raw: impl AsRef<str>) -> Result<Self, RefError> {
         let raw = raw.as_ref();
         if raw.is_empty() || raw.chars().any(char::is_control) {
             return Err(RefError::BadRaw {
@@ -150,9 +202,14 @@ impl<K: Kind> Ref<K> {
         }
     }
 
-    /// The stable storage key, `<platform>:<raw>`.
+    /// The column pair, for binding into a query.
+    pub fn parts(&self) -> (Platform, &str) {
+        (self.platform, self.raw.as_str())
+    }
+
+    /// The one-line key, `<platform>:<raw>`, for logs and config files.
     pub fn key(&self) -> String {
-        format!("{}:{}", self.platform.key(), self.raw.as_str())
+        format!("{}:{}", self.platform.as_str(), self.raw.as_str())
     }
 }
 
@@ -207,23 +264,31 @@ impl<K: Kind> FromStr for Ref<K> {
             kind: K::NAME,
             key: key.to_string(),
         })?;
-        let platform = Platform::from_key(platform).ok_or_else(|| RefError::BadKey {
-            kind: K::NAME,
-            key: key.to_string(),
-        })?;
-        Ref::new(platform, raw)
+        Ref::from_stored(platform.parse()?, raw)
     }
+}
+
+/// The JSON shape of a ref: the column pair, with the platform typed.
+#[derive(Serialize, Deserialize)]
+struct RefRepr<'a> {
+    platform: Platform,
+    #[serde(borrow)]
+    id: std::borrow::Cow<'a, str>,
 }
 
 impl<K: Kind> Serialize for Ref<K> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.key())
+        RefRepr {
+            platform: self.platform,
+            id: std::borrow::Cow::Borrowed(self.raw.as_str()),
+        }
+        .serialize(s)
     }
 }
 impl<'de, K: Kind> Deserialize<'de> for Ref<K> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let key = String::deserialize(d)?;
-        key.parse().map_err(serde::de::Error::custom)
+        let r = RefRepr::deserialize(d)?;
+        Ref::from_stored(r.platform, r.id).map_err(serde::de::Error::custom)
     }
 }
 
@@ -233,6 +298,13 @@ pub enum RefError {
     BadRaw { kind: &'static str, raw: String },
     #[error("{kind} key {key:?} is not <platform>:<raw>")]
     BadKey { kind: &'static str, key: String },
+    #[error("unknown platform {0:?}")]
+    UnknownPlatform(String),
+    #[error("{platform:?} is {lifecycle:?} and takes no new refs")]
+    NotMinting {
+        platform: Platform,
+        lifecycle: Lifecycle,
+    },
     #[error("{kind} ref belongs to {found:?}, not {expected:?}")]
     WrongPlatform {
         kind: &'static str,
@@ -258,6 +330,40 @@ mod tests {
             assert_eq!(r.key(), key);
             let json = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<UserRef>(&json).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn json_is_the_column_pair_with_a_typed_platform() {
+        let r = UserRef::new(Platform::Stoat, "01HV3W4QY7M0S0C5ZRJ4XK2B7D").unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(json, r#"{"platform":"stoat","id":"01HV3W4QY7M0S0C5ZRJ4XK2B7D"}"#);
+        assert_eq!(serde_json::from_str::<UserRef>(&json).unwrap(), r);
+        assert_eq!(r.parts(), (Platform::Stoat, "01HV3W4QY7M0S0C5ZRJ4XK2B7D"));
+        let bad = r#"{"platform":"irc","id":"x"}"#;
+        assert!(serde_json::from_str::<UserRef>(bad).is_err());
+    }
+
+    #[test]
+    fn a_modelled_platform_mints_no_refs_but_stored_ones_load() {
+        assert_eq!(
+            UserRef::new(Platform::Telegram, "1").unwrap_err(),
+            RefError::NotMinting {
+                platform: Platform::Telegram,
+                lifecycle: Lifecycle::Modelled
+            }
+        );
+        let stored = UserRef::from_stored(Platform::Telegram, "1").unwrap();
+        let json = serde_json::to_string(&stored).unwrap();
+        assert_eq!(serde_json::from_str::<UserRef>(&json).unwrap(), stored);
+    }
+
+    #[test]
+    fn every_platform_column_value_parses_back() {
+        for p in Platform::ALL {
+            assert_eq!(p.as_str().parse::<Platform>().unwrap(), p);
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.as_str()));
         }
     }
 

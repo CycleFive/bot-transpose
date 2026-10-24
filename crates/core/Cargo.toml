@@ -1,9 +1,11 @@
 [package]
 name = "transpose-core"
+description = "Platform-neutral types for a community music bot: refs, places, authority, output, commands, voice"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde.workspace = true

@@ -2,10 +2,10 @@
 //! these same functions on all three platforms, which is the usability check:
 //! the core reads like ordinary domain code.
 
-use crate::authority::{may_control, Decision, Presence, Standing};
+use crate::authority::{Decision, Presence, Standing, may_control};
 use crate::event::{Inbound, Invocation};
 use crate::ids::UserRef;
-use crate::render::{text, Action, Card, Field, Out, OutBody, Span, Visibility};
+use crate::render::{Action, Card, Field, Out, OutBody, Span, Visibility, text};
 use crate::settings::Settings;
 use crate::voice::{Queue, Track};
 

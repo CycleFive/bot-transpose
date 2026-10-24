@@ -6,10 +6,12 @@
 //! renders it within its `PlatformCaps`, and degrades in a known order:
 //! buttons, then reactions, then a text hint.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::caps::{ActionSurface, PlatformCaps};
-use crate::ids::UserRef;
+use crate::ids::{MessageRef, UserRef};
 
 /// Inline rich text. Mentions are refs, never pre-formatted strings:
 /// `<@123>` on Discord, a matrix.to pill on Matrix, `<@01H…>` on Stoat.
@@ -103,6 +105,36 @@ pub enum ActionPlan {
     Hint(Vec<String>),
 }
 
+/// On reaction platforms a press arrives as "user reacted with ⏭ on message M",
+/// so the bot must remember what each of its messages offered. Button platforms
+/// carry the action id in the press and never need this.
+#[derive(Debug, Default)]
+pub struct Pressables {
+    by_message: HashMap<MessageRef, Vec<(String, String)>>,
+}
+
+impl Pressables {
+    pub fn remember(&mut self, message: MessageRef, actions: &[Action]) {
+        let pairs = actions.iter().map(|a| (a.emoji.clone(), a.id.clone())).collect();
+        self.by_message.insert(message, pairs);
+    }
+
+    /// The action id for a reaction, or None for a reaction that is not a press
+    /// (someone's own emoji, or a message the bot has forgotten).
+    pub fn resolve(&self, message: &MessageRef, emoji: &str) -> Option<&str> {
+        self.by_message
+            .get(message)?
+            .iter()
+            .find(|(e, _)| e == emoji)
+            .map(|(_, id)| id.as_str())
+    }
+
+    /// Call when the message is replaced or deleted, so the index stays small.
+    pub fn forget(&mut self, message: &MessageRef) {
+        self.by_message.remove(message);
+    }
+}
+
 /// Markdown in the shape Discord and Stoat both read. Mentions use the
 /// adapter's spelling.
 pub fn to_markdown(rich: &[Span], mention: &dyn Fn(&UserRef) -> String) -> String {
@@ -141,9 +173,11 @@ pub fn to_html(rich: &[Span], mention: &dyn Fn(&UserRef) -> String) -> String {
             Span::Bold(k) => out.push_str(&format!("<b>{}</b>", to_html(k, mention))),
             Span::Italic(k) => out.push_str(&format!("<i>{}</i>", to_html(k, mention))),
             Span::Code(c) => out.push_str(&format!("<code>{}</code>", escape_html(c))),
-            Span::Link { label, url } => {
-                out.push_str(&format!("<a href=\"{}\">{}</a>", escape_html(url), escape_html(label)))
-            }
+            Span::Link { label, url } => out.push_str(&format!(
+                "<a href=\"{}\">{}</a>",
+                escape_html(url),
+                escape_html(label)
+            )),
             Span::Mention(u) => out.push_str(&mention(u)),
         }
     }
@@ -176,7 +210,10 @@ fn escape_md(s: &str) -> String {
 }
 
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -192,6 +229,19 @@ mod tests {
             emoji: "⏭".into(),
             command: "!skip".into(),
         }
+    }
+
+    #[test]
+    fn a_reaction_resolves_only_on_the_message_that_offered_it() {
+        let m1 = MessageRef::new(Platform::Stoat, "M1").unwrap();
+        let m2 = MessageRef::new(Platform::Stoat, "M2").unwrap();
+        let mut p = Pressables::default();
+        p.remember(m1.clone(), &[skip()]);
+        assert_eq!(p.resolve(&m1, "⏭"), Some("skip"));
+        assert_eq!(p.resolve(&m1, "🎉"), None);
+        assert_eq!(p.resolve(&m2, "⏭"), None);
+        p.forget(&m1);
+        assert_eq!(p.resolve(&m1, "⏭"), None);
     }
 
     #[test]

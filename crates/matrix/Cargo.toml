@@ -1,9 +1,11 @@
 [package]
 name = "transpose-matrix"
+description = "Matrix adapter: ruma types to and from the neutral model"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde.workspace = true

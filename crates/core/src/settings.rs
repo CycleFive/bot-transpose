@@ -56,7 +56,10 @@ impl Settings {
             Scope::Room(r) => r.platform(),
         };
         let foreign = scope_platform != caps.platform
-            || self.authorized_users.iter().any(|u| u.platform() != caps.platform)
+            || self
+                .authorized_users
+                .iter()
+                .any(|u| u.platform() != caps.platform)
             || self.ignored_rooms.iter().any(|r| r.platform() != caps.platform);
         if foreign {
             return Err(SettingsError::ForeignRef);
@@ -82,9 +85,10 @@ mod tests {
     fn settings_round_trip_through_json_with_keys() {
         let scope = Scope::Community(CommunityRef::new(Platform::Stoat, "01HSERVER").unwrap());
         let mut s = Settings::defaults(scope);
-        s.authorized_users.insert(UserRef::new(Platform::Stoat, "01HUSER").unwrap());
+        s.authorized_users
+            .insert(UserRef::new(Platform::Stoat, "01HUSER").unwrap());
         let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains("\"stoat:01HUSER\""), "{json}");
+        assert!(json.contains(r#"{"platform":"stoat","id":"01HUSER"}"#), "{json}");
         assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), s);
     }
 }

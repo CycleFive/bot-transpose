@@ -13,4 +13,5 @@ pub mod ids;
 pub mod place;
 pub mod render;
 pub mod settings;
+pub mod storage;
 pub mod voice;

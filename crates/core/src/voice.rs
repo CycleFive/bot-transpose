@@ -61,10 +61,14 @@ pub struct AudioSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceEvent {
     Ended,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     Disconnected,
     /// Someone joined or left the bot's room (for auto-pause on an empty room).
-    Listeners { present: Vec<UserRef> },
+    Listeners {
+        present: Vec<UserRef>,
+    },
 }
 
 /// One platform's way into voice. Async in a real bot; plain here, because the

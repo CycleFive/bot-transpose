@@ -8,18 +8,24 @@
 //! - There are no buttons or embeds. A card is HTML (`formatted_body`) with a
 //!   plain `body`, and actions become reactions the bot seeds on its message.
 
-use ruma::events::room::message::RoomMessageEventContent;
-use ruma::events::room::power_levels::{RoomPowerLevels, UserPowerLevel};
 use ruma::events::StateEventType;
+use ruma::events::reaction::ReactionEventContent;
+use ruma::events::relation::Annotation;
+use ruma::events::room::message::{MessageType, RoomMessageEventContent};
+use ruma::events::room::power_levels::{RoomPowerLevels, UserPowerLevel};
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, UserId};
+use serde::Deserialize;
 use transpose_core::authority::{Level, Standing};
 use transpose_core::caps::{
-    ActionSurface, AuthorityModel, CommandSurface, EmbedLevel, PlatformCaps, PrivateReply,
-    VoiceSupport,
+    ActionSurface, AuthorityModel, CommandSurface, EmbedLevel, PlatformCaps, PrivateReply, VoiceSupport,
 };
+use transpose_core::command::{CommandSpec, ParseError, parse_text};
+use transpose_core::event::{Inbound, Invocation};
 use transpose_core::ids::{CommunityRef, MessageRef, Platform, RefError, RoomRef, ThreadRef, UserRef};
 use transpose_core::place::Place;
-use transpose_core::render::{action_plan, to_html, to_plain, ActionPlan, Card, Span};
+use transpose_core::render::Pressables;
+use transpose_core::render::{ActionPlan, Card, Span, action_plan, to_html, to_plain};
+use transpose_core::voice::LiveKitGrant;
 
 pub const CAPS: PlatformCaps = PlatformCaps {
     platform: Platform::Matrix,
@@ -102,7 +108,10 @@ pub fn render(card: &Card) -> Rendered {
     let mut rich: Vec<Span> = Vec::new();
     if let Some(t) = &card.title {
         let title = match &card.url {
-            Some(url) => Span::Link { label: t.clone(), url: url.clone() },
+            Some(url) => Span::Link {
+                label: t.clone(),
+                url: url.clone(),
+            },
             None => Span::Text(t.clone()),
         };
         rich.push(Span::Bold(vec![title]));
@@ -142,15 +151,83 @@ pub enum AdapterError {
     Id(String),
 }
 
+// ---- inbound -------------------------------------------------------------
+
+/// A text message → a command. Only `m.text` counts: notices are bot output.
+pub fn command(
+    content: &RoomMessageEventContent,
+    sender: &UserId,
+    place: Place,
+    specs: &[CommandSpec],
+    prefix: &str,
+) -> Result<Option<Inbound>, ParseError> {
+    let MessageType::Text(t) = &content.msgtype else {
+        return Ok(None);
+    };
+    match parse_text(specs, prefix, &t.body) {
+        Ok(p) => Ok(Some(Inbound::Command(Invocation {
+            actor: user_ref(sender),
+            place,
+            command: p.command,
+            args: p.args,
+        }))),
+        Err(ParseError::NotACommand) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// An `m.reaction` annotation → an action press, when it is one the bot seeded.
+pub fn press(
+    reaction: &ReactionEventContent,
+    sender: &UserId,
+    place: Place,
+    pressables: &Pressables,
+    bot: &UserId,
+) -> Option<Inbound> {
+    if sender == bot {
+        return None;
+    }
+    let Annotation { event_id, key, .. } = &reaction.relates_to;
+    let message = event_ref(event_id);
+    let action = pressables.resolve(&message, key)?;
+    Some(Inbound::ActionPressed {
+        actor: user_ref(sender),
+        place,
+        message,
+        action: action.to_string(),
+    })
+}
+
+// ---- voice signalling ----------------------------------------------------
+
+/// The LiveKit JWT service's answer, after the bot has published its MatrixRTC
+/// membership and exchanged a Matrix OpenID token. Shape per lk-jwt-service's
+/// `/sfu/get`; verify before relying on it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SfuResponse {
+    pub url: String,
+    pub jwt: String,
+}
+
+/// Where Matrix signalling ends. Element Call encrypts call media with keys
+/// sent over Matrix, so the media layer must take part in that exchange.
+pub fn grant(resp: SfuResponse) -> LiveKitGrant {
+    LiveKitGrant {
+        url: resp.url,
+        token: resp.jwt,
+        media_e2ee: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ruma::events::room::power_levels::{RoomPowerLevelsEventContent, RoomPowerLevelsSource};
     use ruma::events::TimelineEventType;
+    use ruma::events::room::power_levels::{RoomPowerLevelsEventContent, RoomPowerLevelsSource};
     use ruma::room_version_rules::AuthorizationRules;
     use ruma::{int, owned_room_id, owned_user_id};
     use transpose_core::authority::{Gate, Presence};
-    use transpose_core::bot::{now_playing, skip, Effect};
+    use transpose_core::bot::{Effect, now_playing, skip};
     use transpose_core::caps::PlatformCaps;
     use transpose_core::place::Scope;
     use transpose_core::settings::Settings;
@@ -162,9 +239,15 @@ mod tests {
         // As homeservers create rooms: changing power levels needs 100. Without
         // this entry it falls back to state_default (50), and a DJ at 50 could
         // rewrite everyone's power, so `standing` would rightly call them admin.
-        content.events.insert(TimelineEventType::RoomPowerLevels, int!(100));
+        content
+            .events
+            .insert(TimelineEventType::RoomPowerLevels, int!(100));
         content.users.insert(dj.clone(), int!(50));
-        RoomPowerLevels::new(RoomPowerLevelsSource::Original(content), &rules, [creator.clone()])
+        RoomPowerLevels::new(
+            RoomPowerLevelsSource::Original(content),
+            &rules,
+            [creator.clone()],
+        )
     }
 
     #[test]
@@ -201,10 +284,27 @@ mod tests {
         s.check(&CAPS).unwrap();
         let u = user_ref(&dj);
         let mut q = Queue::default();
-        q.enqueue(Track { title: "x".into(), url: "u".into(), duration_secs: None, requested_by: u.clone() });
-        assert!(matches!(skip(&u, &standing(&pl, &dj), &Presence::default(), &s, &mut q), Effect::PlayNext(_)));
+        q.enqueue(Track {
+            title: "x".into(),
+            url: "u".into(),
+            duration_secs: None,
+            requested_by: u.clone(),
+        });
+        assert!(matches!(
+            skip(&u, &standing(&pl, &dj), &Presence::default(), &s, &mut q),
+            Effect::PlayNext(_)
+        ));
         let n = owned_user_id!("@n:example.org");
-        assert!(matches!(skip(&user_ref(&n), &standing(&pl, &n), &Presence::default(), &s, &mut q), Effect::Reply(_)));
+        assert!(matches!(
+            skip(
+                &user_ref(&n),
+                &standing(&pl, &n),
+                &Presence::default(),
+                &s,
+                &mut q
+            ),
+            Effect::Reply(_)
+        ));
     }
 
     #[test]
@@ -212,7 +312,12 @@ mod tests {
         let u = user_ref(&owned_user_id!("@alice:example.org"));
         let mut q = Queue::default();
         for n in ["Song A", "Song B"] {
-            q.enqueue(Track { title: n.into(), url: format!("https://youtu.be/{n}"), duration_secs: None, requested_by: u.clone() });
+            q.enqueue(Track {
+                title: n.into(),
+                url: format!("https://youtu.be/{n}"),
+                duration_secs: None,
+                requested_by: u.clone(),
+            });
         }
         q.advance();
         let out = render(&now_playing(q.now.as_ref().unwrap(), &q));
@@ -220,8 +325,62 @@ mod tests {
         let json = serde_json::to_value(&out.content).unwrap();
         assert_eq!(json["msgtype"], "m.notice");
         let html = json["formatted_body"].as_str().unwrap();
-        assert!(html.contains("<a href=\"https://matrix.to/#/@alice:example.org\">"), "{html}");
-        assert!(json["body"].as_str().unwrap().contains("Requested by: @alice:example.org"));
+        assert!(
+            html.contains("<a href=\"https://matrix.to/#/@alice:example.org\">"),
+            "{html}"
+        );
+        assert!(
+            json["body"]
+                .as_str()
+                .unwrap()
+                .contains("Requested by: @alice:example.org")
+        );
         let _ = PlatformCaps::TELEGRAM;
+    }
+
+    #[test]
+    fn text_commands_and_seeded_reactions_become_events() {
+        use transpose_core::command::CommandSpec;
+        let room = owned_room_id!("!music:example.org");
+        let alice = owned_user_id!("@alice:example.org");
+        let bot = owned_user_id!("@crack:example.org");
+        let specs = vec![CommandSpec {
+            name: "skip".into(),
+            summary: "Skip".into(),
+            args: vec![],
+        }];
+        let typed = RoomMessageEventContent::text_plain("!skip");
+        let got = command(&typed, &alice, place(&room, None, None), &specs, "!").unwrap();
+        assert!(matches!(got, Some(Inbound::Command(ref i)) if i.command == "skip"));
+        let notice = RoomMessageEventContent::notice_plain("!skip");
+        assert!(
+            command(&notice, &alice, place(&room, None, None), &specs, "!")
+                .unwrap()
+                .is_none()
+        );
+
+        let sent = ruma::owned_event_id!("$np:example.org");
+        let mut presses = Pressables::default();
+        presses.remember(
+            event_ref(&sent),
+            &[transpose_core::render::Action {
+                id: "skip".into(),
+                label: "Skip".into(),
+                emoji: "⏭".into(),
+                command: "skip".into(),
+            }],
+        );
+        let react = ReactionEventContent::new(Annotation::new(sent.clone(), "⏭".into()));
+        let got = press(&react, &alice, place(&room, None, None), &presses, &bot);
+        assert!(matches!(got, Some(Inbound::ActionPressed { ref action, .. }) if action == "skip"));
+        assert!(press(&react, &bot, place(&room, None, None), &presses, &bot).is_none());
+    }
+
+    #[test]
+    fn matrix_signalling_ends_in_an_encrypted_livekit_grant() {
+        let resp: SfuResponse = serde_json::from_str(r#"{"url":"wss://sfu.example.org","jwt":"j"}"#).unwrap();
+        let g = grant(resp);
+        assert!(g.media_e2ee);
+        assert_eq!(g.token, "j");
     }
 }

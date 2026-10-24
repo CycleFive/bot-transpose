@@ -6,17 +6,18 @@
 //! only place a Discord id becomes a ref is this crate.
 
 use serenity::all::{
-    ButtonStyle, ChannelId, Colour, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
-    GuildId, Permissions, ReactionType, RoleId, UserId,
+    ButtonStyle, ChannelId, Colour, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter, GuildId,
+    Permissions, ReactionType, RoleId, UserId,
 };
 use transpose_core::authority::Standing;
 use transpose_core::caps::{
-    ActionSurface, AuthorityModel, CommandSurface, EmbedLevel, PlatformCaps, PrivateReply,
-    VoiceSupport,
+    ActionSurface, AuthorityModel, CommandSurface, EmbedLevel, PlatformCaps, PrivateReply, VoiceSupport,
 };
+use transpose_core::event::Inbound;
+use transpose_core::ids::MessageRef;
 use transpose_core::ids::{CommunityRef, Platform, RefError, RoleRef, RoomRef, UserRef};
 use transpose_core::place::Place;
-use transpose_core::render::{action_plan, to_markdown, ActionPlan, Card};
+use transpose_core::render::{ActionPlan, Card, action_plan, to_markdown};
 
 pub const CAPS: PlatformCaps = PlatformCaps {
     platform: Platform::Discord,
@@ -53,7 +54,8 @@ to_ref!(GuildId => CommunityRef, ChannelId => RoomRef, UserId => UserRef, RoleId
 /// Neutral ref → Discord id, refusing refs from other platforms.
 pub fn snowflake<K: transpose_core::ids::Kind>(r: &transpose_core::ids::Ref<K>) -> Result<u64, AdapterError> {
     let raw = r.raw_for(Platform::Discord)?;
-    raw.parse().map_err(|_| AdapterError::NotASnowflake(raw.to_string()))
+    raw.parse()
+        .map_err(|_| AdapterError::NotASnowflake(raw.to_string()))
 }
 
 pub fn guild_id(r: &CommunityRef) -> Result<GuildId, AdapterError> {
@@ -126,6 +128,24 @@ pub fn render(card: &Card) -> (CreateEmbed, Vec<CreateActionRow>) {
     (e, rows)
 }
 
+/// A component interaction → an action press. The button carries the action id
+/// as its `custom_id`, so no lookup is needed (contrast Stoat and Matrix).
+pub fn press(
+    custom_id: &str,
+    user: UserId,
+    guild: Option<GuildId>,
+    channel: ChannelId,
+    message: serenity::all::MessageId,
+) -> Inbound {
+    Inbound::ActionPressed {
+        actor: user.to_ref(),
+        place: place(guild, channel),
+        message: MessageRef::new(Platform::Discord, message.get().to_string())
+            .expect("a snowflake is a valid raw id"),
+        action: custom_id.to_string(),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     #[error(transparent)]
@@ -138,7 +158,7 @@ pub enum AdapterError {
 mod tests {
     use super::*;
     use transpose_core::authority::{Gate, Presence};
-    use transpose_core::bot::{now_playing, skip, Effect};
+    use transpose_core::bot::{Effect, now_playing, skip};
     use transpose_core::place::Scope;
     use transpose_core::settings::Settings;
     use transpose_core::voice::{Queue, Track};
@@ -189,8 +209,37 @@ mod tests {
         s.dj = Gate::Role(dj.to_ref());
         s.check(&CAPS).unwrap();
         let without = standing(Permissions::empty(), &[], false);
-        assert!(matches!(skip(&u, &without, &Presence::default(), &s, &mut q), Effect::Reply(_)));
+        assert!(matches!(
+            skip(&u, &without, &Presence::default(), &s, &mut q),
+            Effect::Reply(_)
+        ));
         let with = standing(Permissions::empty(), &[dj], false);
-        assert!(matches!(skip(&u, &with, &Presence::default(), &s, &mut q), Effect::PlayNext(_)));
+        assert!(matches!(
+            skip(&u, &with, &Presence::default(), &s, &mut q),
+            Effect::PlayNext(_)
+        ));
+    }
+
+    #[test]
+    fn a_button_press_carries_its_action_id() {
+        let ev = press(
+            "skip",
+            UserId::new(42),
+            Some(GuildId::new(1)),
+            ChannelId::new(2),
+            serenity::all::MessageId::new(3),
+        );
+        let Inbound::ActionPressed {
+            actor,
+            place,
+            message,
+            action,
+        } = ev
+        else {
+            panic!("expected a press")
+        };
+        assert_eq!((actor.key(), action.as_str()), ("discord:42".to_string(), "skip"));
+        assert_eq!(place.community.unwrap().key(), "discord:1");
+        assert_eq!(message.key(), "discord:3");
     }
 }

@@ -25,8 +25,13 @@ pub struct ArgSpec {
 pub enum ArgKind {
     /// Takes the rest of the line when it is the last argument.
     Text,
-    Integer { min: i64, max: i64 },
-    Choice { options: Vec<String> },
+    Integer {
+        min: i64,
+        max: i64,
+    },
+    Choice {
+        options: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,12 +99,13 @@ pub fn parse_text(specs: &[CommandSpec], prefix: &str, line: &str) -> Result<Par
                 ArgValue::Integer(n)
             }
             ArgKind::Choice { options } => {
-                let hit = options.iter().find(|o| o.eq_ignore_ascii_case(token)).ok_or_else(|| {
-                    ParseError::Invalid {
+                let hit = options
+                    .iter()
+                    .find(|o| o.eq_ignore_ascii_case(token))
+                    .ok_or_else(|| ParseError::Invalid {
                         arg: a.name.clone(),
                         why: format!("one of {}", options.join(", ")),
-                    }
-                })?;
+                    })?;
                 ArgValue::Text(hit.clone())
             }
         };
@@ -143,7 +149,10 @@ mod tests {
     #[test]
     fn the_last_text_argument_takes_the_rest_of_the_line() {
         let p = parse_text(&specs(), "!", "!play  never gonna give you up ").unwrap();
-        assert_eq!(p.args, vec![("query".into(), ArgValue::Text("never gonna give you up".into()))]);
+        assert_eq!(
+            p.args,
+            vec![("query".into(), ArgValue::Text("never gonna give you up".into()))]
+        );
     }
 
     #[test]
