@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/discord", "crates/matrix", "crates/stoat"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+transpose-core = { path = "crates/core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+serenity = { version = "0.12.5", default-features = false, features = ["model", "builder", "rustls_backend"] }
+ruma = { version = "0.17.2", features = ["events"] }
+rive-models = "1.2.1"

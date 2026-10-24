@@ -1,0 +1,13 @@
+[package]
+name = "transpose-stoat"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+transpose-core.workspace = true
+rive-models.workspace = true
